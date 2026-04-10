@@ -1,4 +1,5 @@
 import argparse
+import io
 import os
 import pickle
 from datetime import timedelta
@@ -37,6 +38,49 @@ TICKER_MAP = {
     "SBIN": "SBIN.NS",
     "ICICIBANK": "ICICIBANK.NS",
 }
+
+
+class PortableStandardScaler:
+    """Lightweight substitute for sklearn StandardScaler used only for inference."""
+
+    def __init__(self):
+        self.mean_ = None
+        self.scale_ = None
+        self.var_ = None
+        self.n_features_in_ = None
+        self.n_samples_seen_ = None
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if self.mean_ is None or self.scale_ is None:
+            raise RuntimeError("Scaler is missing mean_/scale_ and cannot transform inputs.")
+        scale = np.where(np.asarray(self.scale_) == 0, 1.0, np.asarray(self.scale_))
+        return (X - np.asarray(self.mean_)) / scale
+
+
+class _SklearnSafeUnpickler(pickle.Unpickler):
+    """Unpickler that remaps sklearn StandardScaler to a local portable class."""
+
+    def find_class(self, module, name):
+        if module == "sklearn.preprocessing._data" and name == "StandardScaler":
+            return PortableStandardScaler
+        return super().find_class(module, name)
+
+
+def safe_load_artifacts_pickle(path):
+    with open(path, "rb") as f:
+        data = f.read()
+
+    try:
+        return pickle.loads(data)
+    except Exception as primary_exc:
+        try:
+            return _SklearnSafeUnpickler(io.BytesIO(data)).load()
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"Failed to load artifacts from {path}. "
+                f"Primary error: {primary_exc}. Fallback error: {fallback_exc}"
+            ) from fallback_exc
 
 
 class CNNLSTMDualHead(nn.Module):
@@ -254,7 +298,7 @@ def next_business_day(date_str):
 
 
 def build_inference_batch(full_data, scaler, asof_date):
-    asof = pd.to_datetime(asof_date)
+    asof = pd.to_datetime(asof_date).tz_localize(None)
     X_batch = []
     meta = []
 
@@ -293,16 +337,15 @@ def build_inference_batch(full_data, scaler, asof_date):
 
 
 def load_artifacts(base_dir, device):
-    model_path = os.path.join(base_dir, "saved_model", "dual_head_transformer.pt")
-    scaler_path = os.path.join(base_dir, "saved_model", "scaler.pkl")
+    model_path = os.path.join(base_dir, "saved_model_cnn", "dual_head_transformer.pt")
+    scaler_path = os.path.join(base_dir, "saved_model_cnn", "scaler.pkl")
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model weights not found: {model_path}")
     if not os.path.exists(scaler_path):
         raise FileNotFoundError(f"Scaler file not found: {scaler_path}")
 
-    with open(scaler_path, "rb") as f:
-        artifacts = pickle.load(f)
+    artifacts = safe_load_artifacts_pickle(scaler_path)
 
     scaler = artifacts["scaler"]
     yr_mean = float(artifacts["yr_mean"])
@@ -326,19 +369,46 @@ def load_artifacts(base_dir, device):
 
 def run_prediction(asof_date):
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    active_device = preferred_device
 
-    model, scaler, yr_mean, yr_std = load_artifacts(base_dir, device)
+    try:
+        model, scaler, yr_mean, yr_std = load_artifacts(base_dir, active_device)
+    except Exception as exc:
+        if preferred_device.type == "cuda":
+            msg = str(exc).lower()
+            if "cuda" in msg or "accelerator" in msg or "cudnn" in msg:
+                print("CUDA model load failed. Falling back to CPU...")
+                active_device = torch.device("cpu")
+                model, scaler, yr_mean, yr_std = load_artifacts(base_dir, active_device)
+            else:
+                raise
+        else:
+            raise
 
     start_date = (pd.to_datetime(asof_date) - timedelta(days=400)).strftime("%Y-%m-%d")
     price_df = download_price_data(TICKER_MAP, start_date=start_date, end_date=asof_date)
     full_data = compute_technical_features(price_df)
 
     X, meta = build_inference_batch(full_data, scaler=scaler, asof_date=asof_date)
-    X = X.to(device)
 
-    with torch.no_grad():
-        cls_logits, reg_pred = model(X)
+    try:
+        X_device = X.to(active_device)
+        with torch.no_grad():
+            cls_logits, reg_pred = model(X_device)
+    except Exception as exc:
+        if active_device.type == "cuda":
+            msg = str(exc).lower()
+            if "cuda" in msg or "accelerator" in msg:
+                print("CUDA inference failed. Retrying on CPU...")
+                model, scaler, yr_mean, yr_std = load_artifacts(base_dir, torch.device("cpu"))
+                X_cpu, meta = build_inference_batch(full_data, scaler=scaler, asof_date=asof_date)
+                with torch.no_grad():
+                    cls_logits, reg_pred = model(X_cpu)
+            else:
+                raise
+        else:
+            raise
 
     probs = torch.softmax(cls_logits, dim=-1).cpu().numpy()
     cls_idx = cls_logits.argmax(dim=1).cpu().numpy()

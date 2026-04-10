@@ -1,0 +1,46 @@
+# Python virtual environment
+.StoEnv/
+.venv/
+venv/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Generated outputs
+results/combined_backtesting/
+results/reports/combined_backtest_results.csv
+results/reports/combined_predictions.csv
+results/reports/*.log
+
+# Model inference dumps
+trend-predictor/saved_model/predictions/
+
+# Data
+# Exclude large processed data, but keep the folder structure
+data/processed/*.csv
+data/processed/price_cache.pkl
+data/raw/*.csv
+
+# Personal/Miscellaneous
+presentation_script.md
+
+# Large/derived model artifacts
+# Commenting these out to allow pre-trained models in GitHub
+# sentiment-predictor/saved_models/
+# trend-predictor/saved_model/*.pt
+# trend-predictor/saved_model/*.pkl
+# trend-predictor/saved_model_cnn/
+# trend-predictor/saved_model_tgnn/

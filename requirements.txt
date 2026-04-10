@@ -21,3 +21,4 @@ tqdm>=4.65.0
 jupyter>=1.0.0
 ipykernel>=6.0.0
 pathlib2>=2.3.7
+openpyxl>=3.1.0           # Excel reading support
